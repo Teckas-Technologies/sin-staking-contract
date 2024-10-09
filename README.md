@@ -25,6 +25,32 @@ To deploy manually, install [`cargo-near`](https://github.com/near/cargo-near) a
 cargo near deploy <account-id>
 ```
 
+## Initialise the contract
+``
+near call your-account.testnet new '{"reward_pool": "1000000000000000000000000"}' --accountId your-account.testnet
+``
+
+## Stake tokens
+
+``
+near call your-account.testnet stake_tokens '{"amount": "100000000000000000000"}' --accountId your-account.testnet --depositYocto 1
+``
+
+## Stake NFT
+``
+near call your-account.testnet stake_nft '{"nft_tier": "Queen"}' --accountId your-account.testnet --depositYocto 1
+``
+
+## View Staker Info
+``
+near view your-account.testnet get_staker_info '{"account_id": "your-account.testnet"}'
+``
+
+## View Staked Tokens
+``
+near view your-account.testnet get_total_staked_tokens
+``
+
 ## Useful Links
 
 - [cargo-near](https://github.com/near/cargo-near) - NEAR smart contract development toolkit for Rust
