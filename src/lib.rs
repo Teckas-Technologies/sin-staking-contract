@@ -4,6 +4,9 @@ use near_sdk::serde::{Serialize, Deserialize};
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
 use near_sdk::json_types::U128;
 
+const LOCKUP_PERIOD: u64 = 30 * 24 * 60 * 60 * 1_000_000_000; // 30 days in nanoseconds
+
+
 #[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(crate = "near_sdk::serde")]
 pub enum NFTTier {
@@ -99,5 +102,49 @@ impl StakingContract {
 
     pub fn get_reward_pool(&self) -> U128 {
         U128(self.reward_pool)
+    }
+
+    pub fn calculate_rewards(&self, account_id: AccountId) -> U128 {
+        if let Some(staker) = self.stakers.get(&account_id) {
+            let duration_staked = env::block_timestamp() - staker.staked_at;
+
+
+            let reward = (staker.staked_amount * self.reward_rate * duration_staked as u128)
+                / (1_000_000_000 * 1_000_000_000); 
+            U128(reward)
+        } else {
+            U128(0)
+        }
+    }
+
+
+    pub fn claim_rewards(&mut self, account_id: AccountId) {
+        let mut staker = self.stakers.get(&account_id).expect("No staking found for user.");
+
+        assert!(
+            env::block_timestamp() >= staker.staked_at + LOCKUP_PERIOD,
+            "Lock-up period has not passed."
+        );
+        assert!(
+            !staker.rewards_claimed,
+            "Rewards already claimed."
+        );
+
+        let rewards = self.calculate_rewards(account_id.clone()).0;
+
+        assert!(
+            rewards <= self.reward_pool,
+            "Not enough tokens in reward pool."
+        );
+
+        // Transfer rewards
+        Promise::new(account_id.clone()).transfer(rewards);
+
+        // Update contract state
+        self.reward_pool -= rewards;
+        staker.rewards_claimed = true;
+        self.stakers.insert(&account_id, &staker);
+
+        env::log_str("Rewards claimed successfully.");
     }
 }
