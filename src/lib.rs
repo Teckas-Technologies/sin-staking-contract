@@ -1,123 +1,115 @@
-use near_sdk::{env, near_bindgen, AccountId, Promise, PanicOnDefault};
-use near_sdk::collections::LookupMap;
-use near_sdk::serde::{Serialize, Deserialize};
-use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::{LookupMap};
+use near_sdk::{env, near_bindgen, AccountId, Promise, PanicOnDefault, BorshStorageKey};
 use near_sdk::json_types::U128;
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+pub type Balance = u128;
 
+// Constants
 const LOCKUP_PERIOD: u64 = 30 * 24 * 60 * 60 * 1_000_000_000; // 30 days in nanoseconds
 
+#[derive(BorshStorageKey, BorshSerialize)]
+pub enum StorageKeys {
+    Stakers,
+    NftTiers,
+}
 
-#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(crate = "near_sdk::serde")]
+#[derive(Debug, Clone, PartialEq, BorshDeserialize, BorshSerialize)]
 pub enum NFTTier {
     Queen,
     Worker,
     Drone,
 }
 
-#[derive(BorshDeserialize, BorshSerialize)]
+#[derive(Debug, Clone, BorshDeserialize, BorshSerialize)]
 pub struct Staker {
-    pub staked_amount: u128,
+    pub staked_amount: Balance,
     pub nft_tier: Option<NFTTier>,
     pub staked_at: u64,
+    pub rewards_claimed: bool,
 }
 
 #[near_bindgen]
 #[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
 pub struct StakingContract {
-    pub stakers: LookupMap<AccountId, Staker>,
-    pub nft_tier_info: LookupMap<AccountId, NFTTier>,
-    pub total_staked_tokens: u128,
-    pub reward_pool: u128,
+    stakers: LookupMap<AccountId, Staker>,
+    reward_pool: Balance,
+    total_staked: Balance,
+    reward_rate: Balance,
+    nft_tiers: LookupMap<AccountId, NFTTier>,
 }
 
 #[near_bindgen]
 impl StakingContract {
     #[init]
-    pub fn new(reward_pool: U128) -> Self {
-        assert!(!env::state_exists(), "Already initialized");
+    pub fn new(reward_pool: U128, reward_rate: U128) -> Self {
         Self {
-            stakers: LookupMap::new(b"s".to_vec()),
-            nft_tier_info: LookupMap::new(b"n".to_vec()),
-            total_staked_tokens: 0,
+            stakers: LookupMap::new(StorageKeys::Stakers),
             reward_pool: reward_pool.0,
+            total_staked: 0,
+            reward_rate: reward_rate.0,
+            nft_tiers: LookupMap::new(StorageKeys::NftTiers),
         }
     }
 
-    pub fn stake_tokens(&mut self, amount: U128) {
-        let account_id = env::predecessor_account_id();
-        let staked_at = env::block_timestamp();
-
-        assert!(amount.0 > 0, "Amount must be greater than 0");
-        let mut staker = self.stakers.get(&account_id).unwrap_or(Staker {
+    pub fn stake_tokens(&mut self, account_id: AccountId, amount: U128) {
+        let mut staker = self.stakers.get(&account_id).unwrap_or_else(|| Staker {
             staked_amount: 0,
             nft_tier: None,
-            staked_at: 0,
+            staked_at: env::block_timestamp(),
+            rewards_claimed: false,
         });
 
         staker.staked_amount += amount.0;
-        staker.staked_at = staked_at;
+        staker.staked_at = env::block_timestamp();
+        staker.rewards_claimed = false;
+
+        self.total_staked += amount.0;
 
         self.stakers.insert(&account_id, &staker);
 
-        self.total_staked_tokens += amount.0;
-
-        env::log_str(&format!(
-            "Staked {} tokens for account: {}",
-            amount.0, account_id
-        ));
+        env::log_str("Tokens staked successfully.");
     }
 
-    pub fn stake_nft(&mut self, nft_tier: NFTTier) {
-        let account_id = env::predecessor_account_id();
-        let staked_at = env::block_timestamp();
-        let mut staker = self.stakers.get(&account_id).unwrap_or(Staker {
+    pub fn stake_nft(&mut self, account_id: AccountId, nft_tier: String) {
+        let tier = match nft_tier.as_str() {
+            "Queen" => NFTTier::Queen,
+            "Worker" => NFTTier::Worker,
+            "Drone" => NFTTier::Drone,
+            _ => panic!("Invalid NFT tier"),
+        };
+
+        let mut staker = self.stakers.get(&account_id).unwrap_or_else(|| Staker {
             staked_amount: 0,
             nft_tier: None,
-            staked_at: 0,
+            staked_at: env::block_timestamp(),
+            rewards_claimed: false,
         });
 
-        staker.nft_tier = Some(nft_tier.clone());
-        staker.staked_at = staked_at;
+        staker.nft_tier = Some(tier.clone());
+        staker.staked_at = env::block_timestamp();
+        staker.rewards_claimed = false;
 
         self.stakers.insert(&account_id, &staker);
+        self.nft_tiers.insert(&account_id, &tier);
 
-
-        self.nft_tier_info.insert(&account_id, &nft_tier);
-
-
-        env::log_str(&format!(
-            "Staked an NFT with tier {:?} for account: {}",
-            nft_tier, account_id
-        ));
-    }
-
-    pub fn get_staker_info(&self, account_id: AccountId) -> Option<Staker> {
-        self.stakers.get(&account_id)
-    }
-
-    pub fn get_total_staked_tokens(&self) -> U128 {
-        U128(self.total_staked_tokens)
-    }
-
-    pub fn get_reward_pool(&self) -> U128 {
-        U128(self.reward_pool)
+        env::log_str("NFT staked successfully.");
     }
 
     pub fn calculate_rewards(&self, account_id: AccountId) -> U128 {
         if let Some(staker) = self.stakers.get(&account_id) {
             let duration_staked = env::block_timestamp() - staker.staked_at;
 
-
+            // Rewards calculation based on time staked and reward rate
             let reward = (staker.staked_amount * self.reward_rate * duration_staked as u128)
-                / (1_000_000_000 * 1_000_000_000); 
+                / (1_000_000_000 * 1_000_000_000); // scale to match NEAR token
+
             U128(reward)
         } else {
             U128(0)
         }
     }
 
-
+    // Claim Rewards
     pub fn claim_rewards(&mut self, account_id: AccountId) {
         let mut staker = self.stakers.get(&account_id).expect("No staking found for user.");
 
@@ -146,5 +138,50 @@ impl StakingContract {
         self.stakers.insert(&account_id, &staker);
 
         env::log_str("Rewards claimed successfully.");
+    }
+
+    // Unstake Tokens or NFTs
+    pub fn unstake(&mut self, account_id: AccountId) {
+        let staker = self.stakers.get(&account_id).expect("No staking found for user.");
+
+        assert!(
+            env::block_timestamp() >= staker.staked_at + LOCKUP_PERIOD,
+            "Lock-up period has not passed."
+        );
+
+        // Transfer staked tokens back to the user
+        if staker.staked_amount > 0 {
+            Promise::new(account_id.clone()).transfer(staker.staked_amount);
+        }
+
+        // Remove NFT tier if any
+        if staker.nft_tier.is_some() {
+            self.nft_tiers.remove(&account_id);
+        }
+
+        // Update contract state
+        self.total_staked -= staker.staked_amount;
+        self.stakers.remove(&account_id);
+
+        env::log_str("Tokens and/or NFTs unstaked successfully.");
+    }
+
+    // Utility function to create test tokens for staking
+    pub fn create_test_tokens(&mut self, account_id: AccountId, amount: U128) {
+        // This is a simple mock to simulate token creation for test purposes.
+        Promise::new(account_id.clone()).transfer(amount.0);
+        env::log_str("Test tokens created.");
+    }
+
+    // Utility function to mint NFTs with metadata defining tiers
+    pub fn mint_test_nft(&mut self, account_id: AccountId, tier: String) {
+        let nft_tier = match tier.as_str() {
+            "Queen" => NFTTier::Queen,
+            "Worker" => NFTTier::Worker,
+            "Drone" => NFTTier::Drone,
+            _ => panic!("Invalid tier"),
+        };
+        self.nft_tiers.insert(&account_id, &nft_tier);
+        env::log_str(&format!("Minted NFT of tier: {}", tier));
     }
 }
