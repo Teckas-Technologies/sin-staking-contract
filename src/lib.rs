@@ -1,5 +1,5 @@
 use near_sdk::collections::{LookupMap};
-use near_sdk::{env, near_bindgen, AccountId, Promise, PanicOnDefault, BorshStorageKey};
+use near_sdk::{env, near_bindgen, AccountId, BorshStorageKey, NearToken, PanicOnDefault, Promise};
 use near_sdk::json_types::U128;
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
 pub type Balance = u128;
@@ -130,7 +130,7 @@ impl StakingContract {
         );
 
         // Transfer rewards
-        Promise::new(account_id.clone()).transfer(rewards);
+        Promise::new(account_id.clone()).transfer(NearToken::from_yoctonear(rewards));
 
         // Update contract state
         self.reward_pool -= rewards;
@@ -151,7 +151,7 @@ impl StakingContract {
 
         // Transfer staked tokens back to the user
         if staker.staked_amount > 0 {
-            Promise::new(account_id.clone()).transfer(staker.staked_amount);
+            Promise::new(account_id.clone()).transfer( NearToken::from_yoctonear(staker.staked_amount));
         }
 
         // Remove NFT tier if any
@@ -169,7 +169,7 @@ impl StakingContract {
     // Utility function to create test tokens for staking
     pub fn create_test_tokens(&mut self, account_id: AccountId, amount: U128) {
         // This is a simple mock to simulate token creation for test purposes.
-        Promise::new(account_id.clone()).transfer(amount.0);
+        Promise::new(account_id.clone()).transfer(NearToken::from_yoctonear(amount.0));
         env::log_str("Test tokens created.");
     }
 
