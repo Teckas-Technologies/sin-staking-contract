@@ -2823,6 +2823,8 @@ dependencies = [
  "borsh 0.9.3",
  "near-sdk",
  "near-workspaces",
+ "serde",
+ "serde_derive",
  "serde_json",
  "tokio",
 ]
