@@ -31,11 +31,11 @@ pub struct Staker {
 #[near_bindgen]
 #[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
 pub struct StakingContract {
-    stakers: LookupMap<AccountId, Staker>,
-    reward_pool: Balance,
-    total_staked: Balance,
-    reward_rate: Balance,
-    nft_tiers: LookupMap<AccountId, NFTTier>,
+    pub stakers: LookupMap<AccountId, Staker>,
+    pub reward_pool: Balance,
+    pub total_staked: Balance,
+    pub reward_rate: Balance,
+    pub nft_tiers: LookupMap<AccountId, NFTTier>,
 }
 
 #[near_bindgen]
@@ -97,17 +97,35 @@ impl StakingContract {
 
     pub fn calculate_rewards(&self, account_id: AccountId) -> U128 {
         if let Some(staker) = self.stakers.get(&account_id) {
-            let duration_staked = env::block_timestamp() - staker.staked_at;
-
-            // Rewards calculation based on time staked and reward rate
-            let reward = (staker.staked_amount * self.reward_rate * duration_staked as u128)
-                / (1_000_000_000 * 1_000_000_000); // scale to match NEAR token
-
+            let current_time = env::block_timestamp();
+            let duration_staked = current_time.saturating_sub(staker.staked_at); // Duration in nanoseconds
+            
+            if duration_staked < LOCKUP_PERIOD {
+                // If the lockup period hasn't passed, return 0 rewards.
+                return U128(0);
+            }
+    
+            // Convert nanoseconds to seconds (1 second = 1_000_000_000 nanoseconds)
+            let duration_in_seconds = duration_staked / 1_000_000_000;
+    
+            // Calculate the base reward as: staked_amount * reward_rate * duration_in_seconds
+            let base_reward = staker.staked_amount
+                .checked_mul(self.reward_rate)
+                .expect("Multiplication overflow")
+                .checked_mul(duration_in_seconds as u128)
+                .expect("Multiplication overflow");
+    
+            // Final reward calculation - Divide by a large number to normalize (or scale based on tokenomics)
+            // Adjust this scaling factor depending on the magnitude of your reward_rate and the expected token supply.
+            let reward = base_reward / 1_000_000_000; // Scale down
+    
+            // Return the reward as U128
             U128(reward)
         } else {
             U128(0)
         }
     }
+    
 
     // Claim Rewards
     pub fn claim_rewards(&mut self, account_id: AccountId) {
@@ -183,5 +201,61 @@ impl StakingContract {
         };
         self.nft_tiers.insert(&account_id, &nft_tier);
         env::log_str(&format!("Minted NFT of tier: {}", tier));
+    }
+
+    // Get staker details by account ID
+    pub fn get_staker(&self, account_id: AccountId) -> Option<Staker> {
+        self.stakers.get(&account_id)
+    }
+
+    // Get staked amount by account ID
+    pub fn get_staked_amount(&self, account_id: AccountId) -> U128 {
+        if let Some(staker) = self.stakers.get(&account_id) {
+            U128(staker.staked_amount)
+        } else {
+            U128(0)
+        }
+    }
+
+    // Get NFT tier staked by account ID
+    pub fn get_nft_tier(&self, account_id: AccountId) -> Option<String> {
+        if let Some(tier) = self.nft_tiers.get(&account_id) {
+            Some(match tier {
+                NFTTier::Queen => "Queen".to_string(),
+                NFTTier::Worker => "Worker".to_string(),
+                NFTTier::Drone => "Drone".to_string(),
+            })
+        } else {
+            None
+        }
+    }
+
+    // Get the total staked amount in the contract
+    pub fn get_total_staked(&self) -> U128 {
+        U128(self.total_staked)
+    }
+
+    // Get the reward pool balance
+    pub fn get_reward_pool(&self) -> U128 {
+        U128(self.reward_pool)
+    }
+
+    // Get the current reward rate
+    pub fn get_reward_rate(&self) -> U128 {
+        U128(self.reward_rate)
+    }
+
+    // Check if the staker has claimed rewards
+    pub fn has_claimed_rewards(&self, account_id: AccountId) -> bool {
+        if let Some(staker) = self.stakers.get(&account_id) {
+            staker.rewards_claimed
+        } else {
+            false
+        }
+    }
+
+    // Get lockup period in seconds (for reference)
+    pub fn get_lockup_period(&self) -> u64 {
+        LOCKUP_PERIOD / 1_000_000_000 // Convert from nanoseconds to seconds
     }
 }
