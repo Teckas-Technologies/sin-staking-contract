@@ -1640,6 +1640,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "near-contract-standards"
+version = "5.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3b985c4df43237b6ae533a6451cfa13de1f12f79f7d6254ba376f0ccd017286"
+dependencies = [
+ "near-sdk",
+]
+
+[[package]]
 name = "near-crypto"
 version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2929,6 +2938,7 @@ name = "sin-staking-contract"
 version = "0.1.0"
 dependencies = [
  "borsh 0.9.3",
+ "near-contract-standards",
  "near-sdk",
  "near-workspaces",
  "serde",
