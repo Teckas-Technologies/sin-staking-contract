@@ -1,198 +1,166 @@
+use near_sdk::{
+    env, near_bindgen, AccountId, Promise, PanicOnDefault, PromiseOrValue, NearToken
+};
 use near_sdk::json_types::U128;
-use near_sdk::{env, near_bindgen, AccountId, PanicOnDefault, PromiseOrValue, BorshStorageKey, NearToken};
-use near_sdk::collections::LookupMap;
+use near_sdk::collections::UnorderedMap;
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
-use near_sdk::{Promise, Gas};
-use near_sdk::ext_contract;
+use serde::{Serialize, Deserialize};
 
-pub type Balance = u128;
-
-pub type TokenId = String;
-const LOCKUP_PERIOD: u64 = 30 * 24 * 60 * 60 * 1_000_000_000; // 30 days in nanoseconds
-const GAS_FOR_NFT_METADATA: Gas = Gas::from_tgas(10);  // Gas for cross-contract call
-
-#[derive(BorshStorageKey, BorshSerialize)]
-pub enum StorageKeys {
-    Stakers,
-    NftTiers,
-}
-
-#[derive(Debug, Clone, PartialEq, BorshDeserialize, BorshSerialize)]
-pub enum NFTTier {
-    Queen,
-    Worker,
-    Drone,
-}
-
-#[derive(Debug, Clone, BorshDeserialize, BorshSerialize)]
-pub struct Staker {
-    pub staked_amount: Balance,
-    pub nft_tier: Option<NFTTier>,
-    pub staked_at: u64,
-    pub rewards_claimed: bool,
-}
+type Balance = u128; 
+const ONE_MONTH_IN_SECONDS: u64 = 2_592_000;
+const SIN_TOKEN_CONTRACT: &str = "sin.token.contract";
+const REWARD_POOL_PER_MONTH: Balance = 2_500_000_000_000_000_000_000_000;
 
 #[near_bindgen]
 #[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
-pub struct StakingContract {
-    pub stakers: LookupMap<AccountId, Staker>,
-    pub reward_pool: Balance, // SIN token balance pool
-    pub total_staked: Balance,
-    pub reward_rate: Balance,
-    pub nft_contract_id: AccountId,  // External NFT contract to check metadata
-    pub sin_token_contract: AccountId,  // SIN token contract for transfers
+pub struct TokenStakingContract {
+    owner: AccountId,
+    funding_wallet: AccountId,
+    staking_info: UnorderedMap<AccountId, StakingInfo>,
+    total_staked_points: f64,
+    reward_pool: Balance,
+    last_distribution_timestamp: u64,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct StakingInfo {
+    amount: Balance,
+    start_time: u64,
+    lockup_duration: u64,
+    weight: f64,
+    claimed: bool,
 }
 
 #[near_bindgen]
-impl StakingContract {
+impl TokenStakingContract {
     #[init]
-    pub fn new(reward_rate: U128, nft_contract_id: AccountId, sin_token_contract: AccountId) -> Self {
+    pub fn new(owner: AccountId, funding_wallet: AccountId) -> Self {
         Self {
-            stakers: LookupMap::new(StorageKeys::Stakers),
-            reward_pool: 0,
-            total_staked: 0,
-            reward_rate: reward_rate.0,
-            nft_contract_id,
-            sin_token_contract,
+            owner,
+            funding_wallet,
+            staking_info: UnorderedMap::new(b"s"),
+            total_staked_points: 0.0,
+            reward_pool: REWARD_POOL_PER_MONTH,
+            last_distribution_timestamp: env::block_timestamp() / 1_000_000_000,
         }
     }
 
-    // Handle the transfer of SIN tokens to fund the reward pool
     #[payable]
-    pub fn fund_reward_pool(&mut self, amount: U128) {
-        assert!(
-            env::predecessor_account_id() == env::current_account_id(),
-            "Only owner can fund the pool."
-        );
-        self.reward_pool += amount.0;
-        env::log_str("Reward pool funded with SIN tokens.");
+    pub fn fund_reward_pool(&mut self) {
+        let account_id = env::predecessor_account_id();
+        assert_eq!(account_id, self.owner, "Only the contract owner can fund the reward pool.");
+        let attached_amount = env::attached_deposit();
+        assert!(attached_amount > NearToken::from_yoctonear(0), "You need to attach some tokens to fund the reward pool.");
+        self.reward_pool +=  NearToken::as_yoctonear(&attached_amount);
+        env::log_str(&format!("{} funded the reward pool with {} SIN tokens", account_id, attached_amount));
     }
 
-    // Implement the ft_on_transfer to handle SIN tokens transferred to the contract
-    #[allow(unused_variables)]
     #[payable]
-    pub fn ft_on_transfer(
-        &mut self,
-        sender_id: AccountId,
-        amount: U128,
-        msg: String,
-    ) -> PromiseOrValue<U128> {
-        assert!(
-            env::predecessor_account_id() == self.sin_token_contract,
-            "Only SIN tokens are accepted."
-        );
+    pub fn stake(&mut self, sender_id: AccountId, amount: U128, msg: String) -> PromiseOrValue<U128> {
+        assert_eq!(env::predecessor_account_id(), SIN_TOKEN_CONTRACT, "Only SIN tokens are accepted.");
+        assert!(amount.0 > 0, "You need to stake a positive amount of SIN tokens.");
 
-        // SIN tokens have been transferred, update the reward pool
-        self.reward_pool += amount.0;
+        let start_time = env::block_timestamp() / 1_000_000_000;
+        let weight = self.calculate_weight(1);
 
-        PromiseOrValue::Value(U128(0)) // Returning 0 means we accepted the transfer
-    }
-
-    // Stake NFT based on external metadata
-    pub fn stake_nft(&mut self, account_id: AccountId, nft_id: TokenId) -> Promise {
-        let nft_contract = self.nft_contract_id.clone();
-        self.get_nft_metadata(nft_contract, nft_id.clone()).then(
-            Self::ext(env::current_account_id()).on_metadata_response(account_id, nft_id)
-        )
-    }
-
-    #[private]
-    pub fn on_metadata_response(&mut self, account_id: AccountId, nft_id: TokenId, #[callback_result] call_result: Result<String, near_sdk::PromiseError>) {
-        let metadata = call_result.expect("Failed to get NFT metadata");
-
-        let nft_tier = match metadata.as_str() {
-            "Queen" => NFTTier::Queen,
-            "Worker" => NFTTier::Worker,
-            "Drone" => NFTTier::Drone,
-            _ => panic!("Invalid NFT tier"),
-        };
-
-        let mut staker = self.stakers.get(&account_id).unwrap_or_else(|| Staker {
-            staked_amount: 0,
-            nft_tier: None,
-            staked_at: env::block_timestamp(),
-            rewards_claimed: false,
+        let mut staking_info = self.staking_info.get(&sender_id).unwrap_or_else(|| StakingInfo {
+            amount: 0,
+            start_time,
+            lockup_duration: ONE_MONTH_IN_SECONDS,
+            weight,
+            claimed: false,
         });
 
-        staker.nft_tier = Some(nft_tier.clone());
-        staker.staked_at = env::block_timestamp();
-        staker.rewards_claimed = false;
+        staking_info.amount += amount.0;
+        staking_info.start_time = start_time;
+        self.total_staked_points += amount.0 as f64 * weight;
 
-        self.stakers.insert(&account_id, &staker);
+        self.staking_info.insert(&sender_id, &staking_info);
 
-        env::log_str("NFT staked successfully.");
+        env::log_str(&format!("{} staked {} SIN tokens", sender_id, amount.0));
+        PromiseOrValue::Value(U128(0)) // Indicates successful handling
     }
 
-    // Calculate and claim SIN token rewards
-    pub fn claim_rewards(&mut self, account_id: AccountId) {
-        let mut staker = self.stakers.get(&account_id).expect("No staking found for user.");
+    pub fn claim_rewards(&mut self) {
+        let account_id = env::predecessor_account_id();
+        let mut staking_info = self.staking_info.get(&account_id).expect("No staking information found for this account.");
 
+        let current_time = env::block_timestamp() / 1_000_000_000;
         assert!(
-            env::block_timestamp() >= staker.staked_at + LOCKUP_PERIOD,
-            "Lock-up period has not passed."
+            current_time >= staking_info.start_time + staking_info.lockup_duration,
+            "Rewards can only be claimed after the lock-up period."
         );
+
+        let reward = self.calculate_rewards(account_id.clone());
+        self.transfer_from_funding_wallet(account_id.clone(), reward);
+
+        staking_info.claimed = true;
+        self.staking_info.insert(&account_id, &staking_info);
+        env::log_str("Rewards claimed successfully!");
+    }
+
+    pub fn unstake(&mut self) {
+        let account_id = env::predecessor_account_id();
+        let mut staking_info = self.staking_info.get(&account_id).expect("No staking information found for this account.");
+
+        let elapsed_time = (env::block_timestamp() / 1_000_000_000) - staking_info.start_time;
         assert!(
-            !staker.rewards_claimed,
-            "Rewards already claimed."
+            elapsed_time >= staking_info.lockup_duration,
+            "Cannot unstake before completing the lock-up period."
         );
 
-        let rewards = self.calculate_rewards(account_id.clone()).0;
-
-        assert!(
-            rewards <= self.reward_pool,
-            "Not enough tokens in reward pool."
-        );
-
-        Promise::new(env::predecessor_account_id()).function_call(
-            "ft_transfer".to_string(),
-            serde_json::json!({
-                "receiver_id": account_id,
-                "amount": rewards,
-            })
-            .to_string()
-            .into_bytes(),
-            NearToken::from_yoctonear(1),  // This is the attached deposit (you may want to change this if you don't need a deposit)
-            Gas::from_tgas(5),  // Specify the gas to use for the function call
-        );
-
-        // Update contract state
-        self.reward_pool -= rewards;
-        staker.rewards_claimed = true;
-        self.stakers.insert(&account_id, &staker);
-
-        env::log_str("Rewards claimed successfully.");
+        self.transfer_from_funding_wallet(account_id.clone(), staking_info.amount);
+        self.total_staked_points -= staking_info.amount as f64 * staking_info.weight;
+        self.staking_info.remove(&account_id);
+        env::log_str("Tokens unstaked successfully!");
     }
 
-    // Helper function to call the NFT contract and retrieve NFT metadata
-    pub fn get_nft_metadata(&self, nft_contract_id: AccountId, token_id: TokenId) -> Promise {
-        Promise::new(nft_contract_id).function_call(
-            "nft_metadata".to_string(),
-            serde_json::json!({
-                "token_id": token_id
-            }).to_string().into_bytes(),
-            NearToken::from_yoctonear(0),  // Attached deposit
-            Gas::from_tgas(5),  // Specifying gas
-        )
+    fn calculate_weight(&self, months: u64) -> f64 {
+        match months {
+            1..=3 => 1.0,
+            4..=6 => 1.5,
+            7..=9 => 2.0,
+            _ => 2.5,
+        }
     }
 
-    // Utility function to calculate rewards based on the staked amount and reward rate
-    pub fn calculate_rewards(&self, account_id: AccountId) -> U128 {
-        let staker = self.stakers.get(&account_id).expect("No staking found for user.");
-        let staking_duration = env::block_timestamp() - staker.staked_at;
-
-        let rewards = (staking_duration as u128 * self.reward_rate) / 1_000_000_000;
-
-        U128(rewards)
+    fn calculate_rewards(&self, account_id: AccountId) -> Balance {
+        let staking_info = self.staking_info.get(&account_id).expect("No staking information found for this account.");
+        let reward_percentage = self.reward_pool as f64 / self.total_staked_points;
+        let tpes = staking_info.amount as f64 * staking_info.weight;
+        (tpes * reward_percentage) as Balance
     }
 
-    // Utility function to get contract reward pool balance
-    pub fn get_reward_pool(&self) -> U128 {
-        U128(self.reward_pool)
+    fn transfer_from_funding_wallet(&self, to: AccountId, amount: Balance) {
+        Promise::new(to).transfer(NearToken::from_yoctonear(amount));
     }
-}
 
-// External contract interface for cross-contract calls
-#[ext_contract(ext)]
-pub trait ExtContract {
-    fn nft_metadata(&self, token_id: TokenId) -> String;
+    pub fn get_total_staked_points(&self) -> f64 {
+        self.total_staked_points
+    }
+
+    pub fn get_reward_pool_balance(&self) -> Balance {
+        self.reward_pool
+    }
+
+    pub fn get_user_staking_info(&self, account_id: AccountId) -> Option<StakingInfo> {
+        self.staking_info.get(&account_id)
+    }
+
+    pub fn calculate_user_rewards(&self, account_id: AccountId) -> Balance {
+        let staking_info = self.staking_info.get(&account_id).unwrap_or_else(|| {
+            env::panic_str("No staking information found for this account.");
+        });
+    
+        let current_time = env::block_timestamp() / 1_000_000_000;
+        if current_time < staking_info.start_time + staking_info.lockup_duration {
+            return 0; // Lockup period not complete, no rewards available
+        }
+    
+        let reward_percentage = self.reward_pool as f64 / self.total_staked_points;
+        let tpes = staking_info.amount as f64 * staking_info.weight;
+        (tpes * reward_percentage) as Balance
+    }
+    
 }
