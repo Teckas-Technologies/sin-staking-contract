@@ -1,7 +1,7 @@
 use near_sdk::{
     borsh::{self, BorshDeserialize, BorshSerialize},
     collections::{UnorderedMap, Vector},
-    env, near_bindgen, AccountId, PanicOnDefault, NearToken
+    env, near_bindgen, AccountId, PanicOnDefault, NearToken,
 };
 use near_sdk::{json_types::U128, Gas};
 use serde_json::json;
@@ -12,7 +12,6 @@ use near_sdk::Promise;
 
 const DAY: u64 = 86400; // Seconds in a day
 const MONTH: u64 = 30 * DAY; // Approximate seconds in a month
-const MONTHLY_REWARD: Balance = 2_500_000_000; // Monthly reward pool
 
 #[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone)]
 #[serde(crate = "near_sdk::serde")]
@@ -29,10 +28,18 @@ pub struct StakerInfo {
     pub total_rewards_claimed: Balance,
 }
 
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct FundingRecord {
+    pub amount: Balance,
+    pub timestamp: u64,
+}
+
 #[derive(BorshDeserialize, BorshSerialize)]
 pub struct RewardDistribution {
     pub total_reward_pool: Balance,
     pub last_distributed: u64, // Timestamp of last reward distribution
+    pub funding_records: Vector<FundingRecord>, // Track funding history
 }
 
 #[near_bindgen]
@@ -62,6 +69,7 @@ impl StakingContract {
             reward_distribution: RewardDistribution {
                 total_reward_pool: 0,
                 last_distributed: env::block_timestamp(),
+                funding_records: Vector::new(b"fundings".to_vec()),
             },
             staking_weight,
         }
@@ -75,35 +83,48 @@ impl StakingContract {
         msg: String,
     ) -> U128 {
         env::log_str(&format!("Received {} tokens from {}", amount.0, sender_id));
+
+        if sender_id == self.owner {
+            assert_eq!(
+                env::predecessor_account_id(),
+                self.sin_token,
+                "Only SIN tokens are accepted for funding"
+            );
+            assert!(amount.0 > 0, "Funding amount must be greater than zero");
     
-        // Parse `msg` as JSON to extract lockup_days
-        let lockup_days: u64 = if msg.is_empty() {
-            30 // Default lockup period if no message provided
+            // Update total reward pool
+            self.reward_distribution.total_reward_pool += amount.0;
+    
+            // Track funding record
+            self.reward_distribution.funding_records.push(&FundingRecord {
+                amount: amount.0,
+                timestamp: env::block_timestamp(),
+            });
+    
+            env::log_str(&format!(
+                "Reward pool funded with {} SIN tokens by {} with message {}",
+                amount.0, env::predecessor_account_id(), msg
+            ));
+            // Return 0 to indicate all tokens were accepted
+            U128(0)
         } else {
-            match serde_json::from_str::<serde_json::Value>(&msg) {
-                Ok(parsed_msg) => parsed_msg["lockup_days"].as_u64().unwrap_or(30),
-                Err(_) => panic!("Invalid message format in ft_on_transfer"),
-            }
-        };
-    
-        // Call the staking logic
-        self.stake_tokens(sender_id, amount.0, lockup_days);
-    
-        // Return 0 to indicate all tokens were accepted
-        U128(0)
-    }
+            assert_eq!(
+                env::predecessor_account_id(),
+                self.sin_token,
+                "Only SIN tokens are accepted for staking"
+            );
+            assert!(amount.0 > 0, "Staking amount must be greater than zero");
+             // Call the staking logic
+            self.stake_tokens(sender_id, amount.0, MONTH);
 
-
-    // Owner funds reward pool (only SIN tokens allowed)
-    #[payable]
-    pub fn fund_reward_pool(&mut self, amount: U128) {
-        assert_eq!(
-            env::predecessor_account_id(),
-            self.sin_token,
-            "Only SIN tokens are accepted for funding"
-        );
-        assert!(amount.0 > 0, "Funding amount must be greater than zero");
-        self.reward_distribution.total_reward_pool += amount.0;
+            env::log_str(&format!(
+                "Staked {} SIN tokens by {} with message {}",
+                amount.0, env::predecessor_account_id(), msg
+            ));
+            // Return 0 to indicate all tokens were accepted
+            U128(0)
+        }
+       
     }
 
     pub fn stake_tokens(&mut self, sender_id: AccountId, amount: u128, lockup_days: u64) {
@@ -149,15 +170,20 @@ impl StakingContract {
         self.stakers.insert(&staker_id, &staker_info);
     }
 
-    // Distribute rewards
-    pub fn distribute_rewards(&mut self) {
+    pub fn distribute_rewards(&mut self, amount: U128) {
         assert_eq!(
             env::predecessor_account_id(),
             self.owner,
-            "Only owner can distribute rewards"
+            "Only the owner can distribute rewards"
         );
 
-        let reward_pool = MONTHLY_REWARD;
+        // Check if the available funds are sufficient
+        assert!(
+            amount.0 <= self.reward_distribution.total_reward_pool,
+            "Insufficient funds in the reward pool for distribution"
+        );
+
+        let reward_pool = amount.0;
         let mut total_tpes = 0.0;
         let mut staker_tpes: HashMap<AccountId, Vec<(usize, f64)>> = HashMap::new();
 
@@ -167,20 +193,18 @@ impl StakingContract {
             for i in 0..staker_info.stakes.len() {
                 let stake = staker_info.stakes.get(i as u64).unwrap();
                 let days_staked = (env::block_timestamp() - stake.start_timestamp) / DAY;
-            
+
                 if days_staked >= 30 {
                     let weight = self.get_staking_weight(days_staked * DAY);
                     let tpes = weight * stake.staked_tokens as f64;
-            
-                    // Convert `u64` to `usize` for compatibility with `staker_tpes`
+
                     stakes_tpes.push((i as usize, tpes));
                     total_tpes += tpes;
                 }
-            
-                // Replace the updated stake
+
                 staker_info.stakes.replace(i as u64, &stake);
             }
-            
+
             staker_tpes.insert(staker_id.clone(), stakes_tpes);
         }
 
@@ -192,16 +216,22 @@ impl StakingContract {
                 let reward = (tpes * reward_percentage) as Balance;
 
                 let mut stake = staker_info.stakes.get(i as u64).unwrap();
-                                stake.claimed_rewards += reward;
-                                staker_info.stakes.replace(i as u64, &stake);
+                stake.claimed_rewards += reward;
+                staker_info.stakes.replace(i as u64, &stake);
             }
 
             self.stakers.insert(&staker_id, &staker_info);
         }
 
+        // Deduct distributed amount from the total reward pool
+        self.reward_distribution.total_reward_pool -= reward_pool;
         self.reward_distribution.last_distributed = env::block_timestamp();
-    }
 
+        env::log_str(&format!(
+            "Distributed {} SIN tokens to stakers",
+            reward_pool
+        ));
+    }
 
     #[payable]
     pub fn claim_reward(&mut self, stake_index: u64) {
@@ -248,52 +278,59 @@ impl StakingContract {
     }
 
     #[payable]
-pub fn unstake_tokens(&mut self, stake_index: u64) {
-    let staker_id = env::predecessor_account_id();
-    let mut staker_info = self.stakers.get(&staker_id).expect("Staker not found");
+    pub fn unstake_tokens(&mut self, stake_index: u64) {
+        let staker_id = env::predecessor_account_id();
+        let mut staker_info = self.stakers.get(&staker_id).expect("Staker not found");
 
-    // Ensure the stake index is valid
-    assert!(
-        stake_index < staker_info.stakes.len(),
-        "Invalid staking record index"
-    );
+        // Ensure the stake index is valid
+        assert!(
+            stake_index < staker_info.stakes.len(),
+            "Invalid staking record index"
+        );
 
-    // Fetch the specific staking record
-    let stake = staker_info.stakes.get(stake_index).expect("Stake not found");
+        // Fetch the specific staking record
+        let stake = staker_info.stakes.get(stake_index).expect("Stake not found");
 
-    // Check if the lockup period has elapsed
-    let current_time = env::block_timestamp();
-    // assert!(
-    //     current_time >= stake.start_timestamp + stake.lockup_period,
-    //     "Cannot unstake before the lockup period ends"
-    // );
+        // Check if the lockup period has elapsed
+        let current_time = env::block_timestamp();
+        assert!(
+            current_time >= stake.start_timestamp + stake.lockup_period,
+            "Cannot unstake before the lockup period ends"
+        );
 
-    // Get the staked tokens to be unstaked
-    let staked_tokens = stake.staked_tokens;
+        // Get the staked tokens to be unstaked
+        let staked_tokens = stake.staked_tokens;
 
-    // Remove the staking record from the staker's stakes
-    staker_info.stakes.swap_remove(stake_index);
+        // Remove the staking record from the staker's stakes
+        staker_info.stakes.swap_remove(stake_index);
 
-    // Update the staker's info
-    self.stakers.insert(&staker_id, &staker_info);
+        // Update the staker's info
+        self.stakers.insert(&staker_id, &staker_info);
 
-    // Transfer the staked tokens back to the staker
-    Promise::new(self.sin_token.clone()).function_call(
-        "ft_transfer".to_string(),                          // Method name
-        serde_json::to_vec(&json!({                         // Arguments
-            "receiver_id": staker_id,
-            "amount": U128(staked_tokens),
-        }))
-        .expect("Failed to serialize ft_transfer arguments"), 
-        NearToken::from_yoctonear(1),                                                  // Attach 1 yoctoNEAR
-        Gas::from_tgas(50),                                 // Attach 50 TGas
-    );
+        // Transfer the staked tokens back to the staker
+        Promise::new(self.sin_token.clone()).function_call(
+            "ft_transfer".to_string(),                          // Method name
+            serde_json::to_vec(&json!({                         // Arguments
+                "receiver_id": staker_id,
+                "amount": U128(staked_tokens),
+            }))
+            .expect("Failed to serialize ft_transfer arguments"), 
+            NearToken::from_yoctonear(1),                                                  // Attach 1 yoctoNEAR
+            Gas::from_tgas(50),                                 // Attach 50 TGas
+        );
 
-    env::log_str(&format!(
-        "Unstaked {} SIN tokens for {} from staking record {}",
-        staked_tokens, staker_id, stake_index
-    ));
-}
+        env::log_str(&format!(
+            "Unstaked {} SIN tokens for {} from staking record {}",
+            staked_tokens, staker_id, stake_index
+        ));
+    }
+
+    pub fn get_funding_records(&self) -> Vec<FundingRecord> {
+        self.reward_distribution
+            .funding_records
+            .iter()
+            .collect::<Vec<FundingRecord>>()
+    }
 
     // Helper functions
     pub fn get_staking_weight(&self, days_staked: u64) -> f64 {
@@ -322,5 +359,9 @@ pub fn unstake_tokens(&mut self, stake_index: u64) {
 
     pub fn get_last_reward_distribution(&self) -> u64 {
         self.reward_distribution.last_distributed
+    }
+
+    pub fn get_available_reward(&self) -> u128 {
+        self.reward_distribution.total_reward_pool
     }
 }
