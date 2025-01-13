@@ -380,13 +380,22 @@ impl StakingContract {
                     .sum::<u128>()
             })
             .sum();
-
+    
+        // Handle edge cases
         if total_reward_pool == 0 || total_staked_tokens == 0 {
-            return 0.0;
+            return 0.0; // No rewards or no staked tokens means no APR
         }
-
-        // Calculate Estimated APR
-        let estimated_apr = (total_reward_pool as f64 / total_staked_tokens as f64) * 100.0;
+    
+        // Scaling to ensure proper comparison (assuming 18 decimals for token precision)
+        let total_reward_pool_scaled = total_reward_pool as f64 / 1e18;
+        let total_staked_tokens_scaled = total_staked_tokens as f64 / 1e18;
+    
+        // Annualize rewards assuming 12 months
+        let annual_rewards = total_reward_pool_scaled;
+    
+        // Calculate estimated APR
+        let estimated_apr = (annual_rewards / total_staked_tokens_scaled) * 100.0;
+    
         estimated_apr
     }
 
