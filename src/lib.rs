@@ -114,8 +114,10 @@ impl StakingContract {
                 "Only SIN tokens are accepted for staking"
             );
             assert!(amount.0 > 0, "Staking amount must be greater than zero");
+             // Default lockup period of 30 days
+            let lockup_days: u64 = 30;
              // Call the staking logic
-            self.stake_tokens(sender_id, amount.0, MONTH);
+            self.stake_tokens(sender_id, amount.0, lockup_days);
 
             env::log_str(&format!(
                 "Staked {} SIN tokens by {} with message {}",
@@ -363,5 +365,79 @@ impl StakingContract {
 
     pub fn get_available_reward(&self) -> u128 {
         self.reward_distribution.total_reward_pool
+    }
+
+    pub fn calculate_current_apr(&self) -> f64 {
+        let total_reward_pool = self.reward_distribution.total_reward_pool;
+        let total_staked_tokens: u128 = self
+            .stakers
+            .iter()
+            .map(|(_, staker_info)| {
+                staker_info
+                    .stakes
+                    .iter()
+                    .map(|stake| stake.staked_tokens)
+                    .sum::<u128>()
+            })
+            .sum();
+
+        if total_reward_pool == 0 || total_staked_tokens == 0 {
+            return 0.0;
+        }
+
+        // Calculate Estimated APR
+        let estimated_apr = (total_reward_pool as f64 / total_staked_tokens as f64) * 100.0;
+        estimated_apr
+    }
+
+    pub fn get_funding_details(&self) -> Vec<FundingRecord> {
+        self.reward_distribution
+            .funding_records
+            .iter()
+            .collect::<Vec<FundingRecord>>()
+    }
+
+    pub fn get_user_rewards(&self, staker_id: AccountId) -> serde_json::Value {
+        if let Some(staker_info) = self.stakers.get(&staker_id) {
+            let total_claimed = staker_info.total_rewards_claimed;
+            let mut total_unclaimed: u128 = 0;
+            let mut total_staked_tokens: u128 = 0;
+    
+            let stake_details: Vec<serde_json::Value> = staker_info
+                .stakes
+                .iter()
+                .map(|stake| {
+                    total_unclaimed = total_unclaimed
+                        .checked_add(stake.claimed_rewards)
+                        .unwrap_or_else(|| {
+                            env::panic_str("Overflow in total_unclaimed calculation");
+                        });
+    
+                    total_staked_tokens = total_staked_tokens
+                        .checked_add(stake.staked_tokens)
+                        .unwrap_or_else(|| {
+                            env::panic_str("Overflow in total_staked_tokens calculation");
+                        });
+    
+                    json!({
+                        "staked_tokens": stake.staked_tokens.to_string(), // Serialize as string for safety
+                        "start_timestamp": stake.start_timestamp,
+                        "lockup_period": stake.lockup_period,
+                        "claimed_rewards": stake.claimed_rewards.to_string() // Serialize as string for safety
+                    })
+                })
+                .collect();
+    
+            json!({
+                "total_staked_tokens": total_staked_tokens.to_string(),
+                "total_claimed_rewards": total_claimed.to_string(),
+                "total_unclaimed_rewards": total_unclaimed.to_string(),
+                "stake_details": stake_details
+            })
+        } else {
+            json!({
+                "error": "No staking information found for this user"
+            })
+        }
     }
 }
