@@ -296,7 +296,7 @@ impl StakingContract {
         // Check if the lockup period has elapsed
         let current_time = env::block_timestamp();
         assert!(
-            current_time >= stake.start_timestamp + stake.lockup_period,
+            current_time >= stake.start_timestamp + stake.lockup_period + 1_000_000_000,
             "Cannot unstake before the lockup period ends"
         );
 
